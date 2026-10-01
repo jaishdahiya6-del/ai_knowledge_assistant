@@ -2,13 +2,14 @@
 AI Personal Knowledge & Research Assistant
 ============================================
 A self-contained Streamlit app combining Pandas/NumPy EDA, Scikit-learn ML,
-a PyTorch neural network, NLP text analysis, SQLite storage, and a local
-retrieval-based AI assistant. No paid APIs, no external uploads, no backend server.
+a PyTorch neural network, NLP text analysis, SQLite storage, local document RAG,
+and a local retrieval-based AI assistant. No paid APIs required (OpenAI optional).
 
 Run with:  streamlit run app.py
 """
 import sys
 import os
+import tempfile
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import streamlit as st
@@ -22,6 +23,9 @@ from src import ml_models as ml
 from src import neural_net as nn_mod
 from src import nlp_analysis as nlp
 from src.assistant import KnowledgeAssistant
+from src.document_loader import process_file_or_directory, load_file, chunk_text
+from src.vector_store import VectorStore
+from src.rag_assistant import RAGAssistant
 
 st.set_page_config(page_title="AI Knowledge Assistant", page_icon="🧠", layout="wide")
 
@@ -53,6 +57,8 @@ if "nn_bundle" not in st.session_state:
     st.session_state.nn_bundle = None
 if "reg_bundle" not in st.session_state:
     st.session_state.reg_bundle = None
+if "rag_chat_history" not in st.session_state:
+    st.session_state.rag_chat_history = []
 
 # ---------------------------------------------------------------------------
 # Sidebar navigation
@@ -61,8 +67,8 @@ st.sidebar.title("🧠 Knowledge Assistant")
 st.sidebar.caption("Personal AI Research & Learning Tracker")
 page = st.sidebar.radio(
     "Navigate",
-    ["🏠 Overview", "✍️ Add Entry", "📊 EDA & Charts", "🤖 ML Prediction",
-     "🔥 Neural Network", "📝 NLP Analysis", "💬 AI Assistant", "⚙️ Data Management"],
+    ["🏠 Overview", "✍️ Add Entry", "📄 Document RAG", "📊 EDA & Charts", "🤖 ML Prediction",
+     "🔥 Neural Network", "📝 NLP Analysis", "💬 DB AI Assistant", "⚙️ Data Management"],
 )
 
 df = db.fetch_all_df()
@@ -76,17 +82,17 @@ if not df.empty:
 # ---------------------------------------------------------------------------
 if page == "🏠 Overview":
     st.title("AI Personal Knowledge & Research Assistant")
-    st.caption("Pandas • NumPy • Scikit-learn • PyTorch • NLP • Streamlit — 100% local, no paid APIs")
+    st.caption("Pandas • NumPy • Scikit-learn • PyTorch • RAG • Vector Store • Streamlit — 100% customizable")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📚 Entries", len(df))
+    c1.metric("📚 DB Entries", len(df))
     c2.metric("⏱️ Hours Logged", f"{df['hours_spent'].sum():.1f}" if not df.empty else "0.0")
     c3.metric("🏷️ Categories", df["category"].nunique() if not df.empty else 0)
     c4.metric("⭐ Avg Priority", f"{df['priority'].mean():.2f}" if not df.empty else "0.0")
 
     st.markdown("---")
     if df.empty:
-        st.info("No data yet. Go to **⚙️ Data Management** to generate sample data, or **✍️ Add Entry** to add your own.")
+        st.info("No data yet. Go to **⚙️ Data Management** to generate sample data, or **✍️ Add Entry** / **📄 Document RAG** to get started.")
     else:
         col1, col2 = st.columns(2)
         with col1:
@@ -129,6 +135,107 @@ elif page == "✍️ Add Entry":
         st.markdown("---")
         st.subheader("All Entries")
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# PAGE: Document RAG
+# ---------------------------------------------------------------------------
+elif page == "📄 Document RAG":
+    st.title("📄 Document Ingestion & RAG Assistant")
+    st.caption("Ingest PDF, TXT, or Markdown documents, search with vector embeddings (FAISS), and answer with cited sources.")
+
+    tab_ingest, tab_ask = st.tabs(["📥 Ingest Documents", "💬 Ask Questions"])
+
+    with tab_ingest:
+        st.subheader("Upload & Index Documents")
+        uploaded_files = st.file_uploader(
+            "Upload document files (.pdf, .txt, .md)",
+            type=["pdf", "txt", "md"],
+            accept_multiple_files=True
+        )
+
+        col1, col2 = st.columns(2)
+        chunk_size = col1.number_input("Chunk Size (chars)", 100, 2000, 500, step=50)
+        chunk_overlap = col2.number_input("Chunk Overlap (chars)", 0, 500, 50, step=10)
+
+        if st.button("🚀 Ingest Uploaded Documents"):
+            if not uploaded_files:
+                st.warning("Please upload at least one file to ingest.")
+            else:
+                all_chunks = []
+                with st.spinner("Processing and chunking uploaded documents..."):
+                    for uploaded_file in uploaded_files:
+                        filename = uploaded_file.name
+                        ext = os.path.splitext(filename)[1].lower()
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
+                            tmp_file.write(uploaded_file.read())
+                            tmp_path = tmp_file.name
+
+                        try:
+                            docs = load_file(tmp_path)
+                            for doc in docs:
+                                doc["metadata"]["source"] = filename
+                                chunks = chunk_text(doc["text"], doc["metadata"], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                                all_chunks.extend(chunks)
+                        finally:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+
+                if all_chunks:
+                    with st.spinner(f"Generating embeddings and adding {len(all_chunks)} chunks to vector store..."):
+                        vector_store = VectorStore()
+                        vector_store.load("data/vector_store")
+                        vector_store.add_documents(all_chunks)
+                        vector_store.save("data/vector_store")
+                    st.success(f"Successfully ingested {len(uploaded_files)} file(s) into vector store ({len(all_chunks)} chunks total)!")
+                else:
+                    st.error("Could not extract any text from uploaded file(s).")
+
+        st.markdown("---")
+        st.subheader("Vector Store Stats")
+        vs = VectorStore()
+        if vs.load("data/vector_store") and vs.index is not None:
+            st.metric("Total Ingested Chunks", vs.index.ntotal)
+            if st.button("🗑️ Clear Vector Index"):
+                vs.clear()
+                vs.save("data/vector_store")
+                st.success("Vector index cleared.")
+                st.rerun()
+        else:
+            st.info("Vector store is currently empty. Upload documents above or use `python cli.py ingest --path <path>`.")
+
+    with tab_ask:
+        st.subheader("Ask Questions with Source Citations")
+        vs = VectorStore()
+        if not vs.load("data/vector_store") or vs.index is None or vs.index.ntotal == 0:
+            st.warning("Vector store is empty. Ingest documents in the 'Ingest Documents' tab first.")
+        else:
+            rag = RAGAssistant(vector_store=vs)
+
+            for item in st.session_state.rag_chat_history:
+                with st.chat_message("user"):
+                    st.markdown(item["user"])
+                with st.chat_message("assistant"):
+                    st.markdown(item["answer"])
+                    if item.get("sources"):
+                        with st.expander("📚 View Citations & Retrieved Chunks"):
+                            for s in item["sources"]:
+                                st.markdown(f"**{s['citation']}**")
+                                st.caption(f"Snippet: {s['snippet']}")
+
+            q = st.chat_input("Ask a question about your ingested documents...")
+            if q:
+                res = rag.answer(q, top_k=3)
+                st.session_state.rag_chat_history.append({
+                    "user": q,
+                    "answer": res["answer"],
+                    "sources": res["sources"]
+                })
+                st.rerun()
+
+            if st.button("Clear RAG Chat"):
+                st.session_state.rag_chat_history = []
+                st.rerun()
 
 # ---------------------------------------------------------------------------
 # PAGE: EDA & Charts
@@ -298,14 +405,14 @@ elif page == "📝 NLP Analysis":
                 st.info(f"Sentiment: **{label}** (score: {score})")
 
 # ---------------------------------------------------------------------------
-# PAGE: AI Assistant
+# PAGE: DB AI Assistant
 # ---------------------------------------------------------------------------
-elif page == "💬 AI Assistant":
-    st.title("AI Assistant — Ask About Your Knowledge Base")
-    st.caption("Local TF-IDF retrieval + rule-based reasoning. No external API calls.")
+elif page == "💬 DB AI Assistant":
+    st.title("DB AI Assistant — Ask About Your SQLite Notes")
+    st.caption("Local TF-IDF retrieval + rule-based reasoning over database entries.")
 
     if df.empty:
-        st.warning("Your knowledge base is empty. Add entries or generate sample data first.")
+        st.warning("Your database is empty. Add entries or generate sample data first.")
     else:
         assistant = KnowledgeAssistant(df)
 
@@ -319,7 +426,7 @@ elif page == "💬 AI Assistant":
             with st.chat_message(role):
                 st.markdown(msg)
 
-        user_q = st.chat_input("Ask anything about your knowledge base...")
+        user_q = st.chat_input("Ask anything about your database entries...")
         if user_q:
             st.session_state.chat_history.append(("user", user_q))
             try:
